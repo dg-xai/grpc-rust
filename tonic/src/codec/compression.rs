@@ -6,7 +6,7 @@ use flate2::read::{GzDecoder, GzEncoder};
 use flate2::read::{ZlibDecoder, ZlibEncoder};
 use std::{borrow::Cow, fmt};
 #[cfg(feature = "zstd")]
-use zstd::stream::read::{Decoder, Encoder};
+use zstd::stream::read::Decoder;
 
 pub(crate) const ENCODING_HEADER: &str = "grpc-encoding";
 pub(crate) const ACCEPT_ENCODING_HEADER: &str = "grpc-accept-encoding";
@@ -237,12 +237,18 @@ pub(crate) fn compress(
         }
         #[cfg(feature = "zstd")]
         CompressionEncoding::Zstd => {
-            let mut zstd_encoder = Encoder::new(
-                &decompressed_buf[0..len],
-                // FIXME: support customizing the compression level
-                zstd::DEFAULT_COMPRESSION_LEVEL,
-            )?;
-            std::io::copy(&mut zstd_encoder, &mut out_writer)?;
+            // Thread-local so the zstd context is reused across requests rather
+            // than reallocated per response.
+            thread_local! {
+                static ZSTD: std::cell::RefCell<zstd::bulk::Compressor<'static>> =
+                    std::cell::RefCell::new(
+                        zstd::bulk::Compressor::new(zstd::DEFAULT_COMPRESSION_LEVEL)
+                            .expect("failed to init thread-local zstd compressor"),
+                    );
+            }
+            let compressed =
+                ZSTD.with(|c| c.borrow_mut().compress(&decompressed_buf[0..len]))?;
+            std::io::Write::write_all(&mut out_writer, &compressed)?;
         }
     }
 
